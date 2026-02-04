@@ -13,11 +13,14 @@ from .radiusgraph import Graph, Node, RadiusGraph
 from pymatgen.core import Structure
 
 try:
-    from .cygraph import make_graph
+    from .cygraph import make_graph, make_line_graph, make_graph_with_line_graph
 except (ImportError, AttributeError):
     make_graph = None
+    make_line_graph = None
+    make_graph_with_line_graph = None
 
 datatype = torch.float32
+USE_C_LINE_GRAPH = True
 
 class GraphConverter(nn.Module):
     """Convert a pymatgen.core.Structure to a RadiusGraph"""
@@ -26,6 +29,7 @@ class GraphConverter(nn.Module):
         self,
         atom_graph_cutoff: float = 6,
         line_graph_cutoff: float = 4,
+        use_c_line_graph: bool = USE_C_LINE_GRAPH,
         verbose: bool = False,
     ) -> None:
         """Initialize the Graph Converter.
@@ -33,6 +37,7 @@ class GraphConverter(nn.Module):
         Args:
             atom_graph_cutoff (float): cutoff radius in atom graph.
             line_graph_cutoff (float): bond length threshold in line graph.
+            use_c_line_graph (bool): use C hash-based line graph builder when available.
             verbose (bool): whether to print the GraphConverter.
         """
         super().__init__()
@@ -40,6 +45,7 @@ class GraphConverter(nn.Module):
         self.line_graph_cutoff = (
             atom_graph_cutoff if line_graph_cutoff is None else line_graph_cutoff
         )
+        self.use_c_line_graph = bool(use_c_line_graph)
         
         if make_graph is not None:
             self.create_graph = self._create_graph_fast
@@ -48,6 +54,10 @@ class GraphConverter(nn.Module):
             self.create_graph = self._create_graph_legacy
             self.algorithm = 'legacy'
             print("fast graph converter algorithm import error, using legacy")
+
+        if self.use_c_line_graph and make_graph_with_line_graph is None:
+            self.use_c_line_graph = False
+            print("fast line graph converter algorithm import error, using legacy")
         
         if verbose:
             print(self)
@@ -57,8 +67,9 @@ class GraphConverter(nn.Module):
         atom_graph_cutoff = self.atom_graph_cutoff
         line_graph_cutoff = self.line_graph_cutoff
         algorithm = self.algorithm
+        line_graph_backend = "c_hash" if self.use_c_line_graph else "python"
         cls_name = type(self).__name__
-        return f"{cls_name}({algorithm=}, {atom_graph_cutoff=}, {line_graph_cutoff=})"
+        return f"{cls_name}({algorithm=}, {line_graph_backend=}, {atom_graph_cutoff=}, {line_graph_cutoff=})"
 
     def forward(
         self,
@@ -86,22 +97,33 @@ class GraphConverter(nn.Module):
             r=self.atom_graph_cutoff, sites=structure.sites, numerical_tol=1e-8
         )
         # Ceate atom graph
-        graph = self.create_graph(
-            n_atoms, center_index, neighbor_index, image, distance
-        )
+        if self.use_c_line_graph and make_graph_with_line_graph is not None:
+            graph, line_graph = self._create_graph_fast_with_line_graph(
+                n_atoms,
+                center_index,
+                neighbor_index,
+                image,
+                distance,
+                self.line_graph_cutoff,
+            )
+        else:
+            graph = self.create_graph(
+                n_atoms, center_index, neighbor_index, image, distance
+            )
         atom_graph, directed2undirected = graph.adjacency_list()
         atom_graph = torch.tensor(atom_graph, dtype=torch.int32)
         directed2undirected = torch.tensor(directed2undirected, dtype=torch.int32)
         undirected2directed = graph.undirected2directed()
         undirected2directed = torch.tensor(undirected2directed, dtype=torch.int32)
         
-        line_graph = []
-        try:
-            line_graph = graph.line_graph_adjacency_list(
-                cutoff=self.line_graph_cutoff
-            ) 
-        except Exception as exc:
-            structure.to(filename="error_graph.cif")
+        if not (self.use_c_line_graph and make_graph_with_line_graph is not None):
+            line_graph = []
+            try:
+                line_graph = graph.line_graph_adjacency_list(
+                    cutoff=self.line_graph_cutoff
+                ) 
+            except Exception as exc:
+                structure.to(filename="error_graph.cif")
 
         line_graph = torch.tensor(line_graph, dtype=torch.int32)
 
@@ -211,12 +233,53 @@ class GraphConverter(nn.Module):
         
         return graph
 
+    @staticmethod
+    def _create_graph_fast_with_line_graph(
+        n_atoms: int,
+        center_index: np.ndarray,
+        neighbor_index: np.ndarray,
+        image: np.ndarray,
+        distance: np.ndarray,
+        line_graph_cutoff: float,
+    ) -> tuple[Graph, np.ndarray]:
+        """Create a Graph and line graph using the C implementation in one pass."""
+        center_index = np.ascontiguousarray(center_index)
+        neighbor_index = np.ascontiguousarray(neighbor_index)
+        image = np.ascontiguousarray(image, dtype=np.int_)
+        distance = np.ascontiguousarray(distance)
+        gc_saved = gc.get_threshold()
+        gc.set_threshold(0)
+        (
+            nodes,
+            directed_edges_list,
+            undirected_edges_list,
+            undirected_edges,
+            line_graph,
+        ) = make_graph_with_line_graph(
+            center_index,
+            len(center_index),
+            neighbor_index,
+            image,
+            distance,
+            n_atoms,
+            line_graph_cutoff,
+        )
+
+        graph = Graph(nodes=nodes)
+        graph.directed_edges_list = directed_edges_list
+        graph.undirected_edges_list = undirected_edges_list
+        graph.undirected_edges = undirected_edges
+        gc.set_threshold(gc_saved[0])
+
+        return graph, line_graph
+
     def as_dict(self) -> dict[str, float]:
         """Save the args of the graph converter."""
         return {
             "atom_graph_cutoff": self.atom_graph_cutoff,
             "line_graph_cutoff": self.line_graph_cutoff,
             "algorithm": self.algorithm,
+            "use_c_line_graph": self.use_c_line_graph,
         }
 
     @classmethod

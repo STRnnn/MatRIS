@@ -1,5 +1,6 @@
 #include "uthash.h"
 #include <stdbool.h>
+#include <stdlib.h>
 
 typedef struct _UndirectedEdge UndirectedEdge;
 typedef struct _DirectedEdge DirectedEdge;
@@ -77,6 +78,22 @@ void append_to_directed_edge_indices(UndirectedEdge* undirected_edge, long direc
 bool is_reversed_directed_edge(DirectedEdge* directed_edge1, DirectedEdge* directed_edge2);
 void free_undirected_edges(StructToUndirectedEdgeList** undirected_edges);
 void free_LongToDirectedEdgeList_in_nodes(Node* nodes, long num_nodes);
+long* create_line_graph(
+        long* center_indices,
+        long num_edges,
+        long* neighbor_indices,
+        long* images,
+        double* distances,
+        long num_atoms,
+        double cutoff,
+        long* out_num_line_edges);
+long* create_line_graph_from_graph(
+        ReturnElems2* returned,
+        double cutoff,
+        long* out_num_line_edges);
+
+static void free_return_elems2(ReturnElems2* returned);
+static long count_directed_edges(Node* node);
 
 
 Node* create_nodes(long num_nodes) {
@@ -247,6 +264,220 @@ void free_LongToDirectedEdgeList_in_nodes(Node* nodes, long num_nodes) {
             free(current);
         }
     }
+}
+
+static void free_return_elems2(ReturnElems2* returned) {
+    if (returned == NULL) {
+        return;
+    }
+
+    for (long idx = 0; idx < returned->num_directed_edges; idx++) {
+        free(returned->directed_edges_list[idx]);
+    }
+
+    for (long idx = 0; idx < returned->num_undirected_edges; idx++) {
+        free(returned->undirected_edges_list[idx]->directed_edge_indices);
+        free(returned->undirected_edges_list[idx]);
+    }
+
+    free_LongToDirectedEdgeList_in_nodes(returned->nodes, returned->num_nodes);
+    free(returned->directed_edges_list);
+    free(returned->undirected_edges_list);
+    free(returned->nodes);
+    free(returned);
+}
+
+long* create_line_graph_from_graph(
+        ReturnElems2* returned,
+        double cutoff,
+        long* out_num_line_edges
+    ) {
+    if (out_num_line_edges == NULL) {
+        return NULL;
+    }
+
+    *out_num_line_edges = 0;
+
+    if (returned == NULL) {
+        *out_num_line_edges = -1;
+        return NULL;
+    }
+
+    long* per_node_edges = malloc(sizeof(long) * returned->num_nodes);
+    long* per_node_total = malloc(sizeof(long) * returned->num_nodes);
+    if (per_node_edges == NULL || per_node_total == NULL) {
+        free(per_node_edges);
+        free(per_node_total);
+        *out_num_line_edges = -1;
+        return NULL;
+    }
+
+    #pragma omp parallel for
+    for (long node_i = 0; node_i < returned->num_nodes; node_i++) {
+        long num_edges = 0;
+        long num_le = 0;
+        long num_lt = 0;
+        LongToDirectedEdgeList* entry;
+
+        for (entry = returned->nodes[node_i].neighbors; entry != NULL; entry = entry->hh.next) {
+            num_edges += entry->num_directed_edges_in_group;
+            for (int e = 0; e < entry->num_directed_edges_in_group; e++) {
+                DirectedEdge* de = entry->directed_edges_list[e];
+                if (de->distance <= cutoff) {
+                    num_le += 1;
+                    if (de->distance < cutoff) {
+                        num_lt += 1;
+                    }
+                }
+            }
+        }
+
+        per_node_edges[node_i] = num_edges;
+        if (num_le > 0 && num_lt > 0) {
+            per_node_total[node_i] = num_lt * (num_le - 1);
+        } else {
+            per_node_total[node_i] = 0;
+        }
+    }
+
+    long total = 0;
+    long max_degree = 0;
+    for (long node_i = 0; node_i < returned->num_nodes; node_i++) {
+        total += per_node_total[node_i];
+        if (per_node_edges[node_i] > max_degree) {
+            max_degree = per_node_edges[node_i];
+        }
+    }
+
+    long* prefix = malloc(sizeof(long) * (returned->num_nodes + 1));
+    if (prefix == NULL) {
+        free(per_node_edges);
+        free(per_node_total);
+        *out_num_line_edges = -1;
+        return NULL;
+    }
+    prefix[0] = 0;
+    for (long node_i = 0; node_i < returned->num_nodes; node_i++) {
+        prefix[node_i + 1] = prefix[node_i] + per_node_total[node_i];
+    }
+
+    long* line_graph = NULL;
+    if (total > 0) {
+        line_graph = malloc(sizeof(long) * total * 5);
+        if (line_graph == NULL) {
+            *out_num_line_edges = -1;
+            free(prefix);
+            free(per_node_edges);
+            free(per_node_total);
+            return NULL;
+        }
+    }
+
+    int alloc_failed = 0;
+    #pragma omp parallel
+    {
+        DirectedEdge** edges = NULL;
+        if (max_degree > 0) {
+            edges = malloc(sizeof(DirectedEdge*) * max_degree);
+            if (edges == NULL) {
+                #pragma omp atomic write
+                alloc_failed = 1;
+            }
+        }
+
+        #pragma omp for
+        for (long node_i = 0; node_i < returned->num_nodes; node_i++) {
+            if (alloc_failed) {
+                continue;
+            }
+
+            long num_edges_in_node = per_node_edges[node_i];
+            if (num_edges_in_node <= 1) {
+                continue;
+            }
+
+            long pos = 0;
+            LongToDirectedEdgeList* entry;
+            for (entry = returned->nodes[node_i].neighbors; entry != NULL; entry = entry->hh.next) {
+                for (int e = 0; e < entry->num_directed_edges_in_group; e++) {
+                    edges[pos] = entry->directed_edges_list[e];
+                    pos += 1;
+                }
+            }
+
+            long write_idx = prefix[node_i];
+            for (long e1 = 0; e1 < num_edges_in_node; e1++) {
+                DirectedEdge* de1 = edges[e1];
+                // de1 uses <= cutoff to mirror Python UDE filtering; de2 uses < cutoff.
+                if (de1->distance > cutoff) {
+                    continue;
+                }
+
+                for (long e2 = 0; e2 < num_edges_in_node; e2++) {
+                    if (e1 == e2) {
+                        continue;
+                    }
+
+                    DirectedEdge* de2 = edges[e2];
+                    if (de2->distance >= cutoff) {
+                        continue;
+                    }
+
+                    long out_idx = write_idx;
+                    line_graph[out_idx * 5 + 0] = node_i;
+                    line_graph[out_idx * 5 + 1] = de1->undirected_edge_index;
+                    line_graph[out_idx * 5 + 2] = de1->index;
+                    line_graph[out_idx * 5 + 3] = de2->undirected_edge_index;
+                    line_graph[out_idx * 5 + 4] = de2->index;
+                    write_idx += 1;
+                }
+            }
+        }
+
+        free(edges);
+    }
+
+    if (alloc_failed) {
+        free(line_graph);
+        free(prefix);
+        free(per_node_edges);
+        free(per_node_total);
+        *out_num_line_edges = -1;
+        return NULL;
+    }
+
+    *out_num_line_edges = total;
+    free(prefix);
+    free(per_node_edges);
+    free(per_node_total);
+    return line_graph;
+}
+
+long* create_line_graph(
+        long* center_indices,
+        long num_edges,
+        long* neighbor_indices,
+        long* images,
+        double* distances,
+        long num_atoms,
+        double cutoff,
+        long* out_num_line_edges
+    ) {
+    if (out_num_line_edges == NULL) {
+        return NULL;
+    }
+
+    *out_num_line_edges = 0;
+
+    ReturnElems2* returned = create_graph(center_indices, num_edges, neighbor_indices, images, distances, num_atoms);
+    if (returned == NULL) {
+        *out_num_line_edges = -1;
+        return NULL;
+    }
+
+    long* line_graph = create_line_graph_from_graph(returned, cutoff, out_num_line_edges);
+    free_return_elems2(returned);
+    return line_graph;
 }
 
 // Returns true if the two directed edges have images that are inverted
